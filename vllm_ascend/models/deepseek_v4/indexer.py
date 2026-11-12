@@ -118,7 +118,8 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
 
     def get_attn_backend(self):
         # Keep these imports lazy to avoid a model-inspection circular import.
-        if self.compress_ratio == 4:
+        if self.compress_ratio in (1, 2, 4):
+            # V4.1 index-K caches (ratio 1/2) run the C4 execution plan.
             from vllm_ascend.attention.dsa_v1 import AscendDSAC4Backend
 
             return AscendDSAC4Backend
@@ -269,6 +270,9 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.skip_topk = skip_topk
         self.use_index_cache = use_index_cache
+        # V4 baseline indexer: keeps the dsa_v1 bridge on the V4 fused path
+        # (the V4.1 indexer in deepseek_v41/indexer.py sets this to True).
+        self.is_v41_indexer = False
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,

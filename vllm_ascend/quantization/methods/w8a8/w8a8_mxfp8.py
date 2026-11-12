@@ -411,9 +411,11 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
 
 @register_scheme(FP8_METHOD, "ds_linear")
 class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
-    """Linear method for DS original W8A8 mxfp(blocksize: 128 * 128) quantization.
+    """Linear method for DS original W8A8 block fp8 quantization.
 
-    scales are reorganize as blocksize 32 * 1 in process_weights_after_loading
+    Supports block-square weight scales: DeepSeek V4 ships 128 * 128 blocks,
+    DeepSeek V4.1 ships 32 * 32 blocks (both ue8m0). Scales are reorganized as
+    blocksize 32 * 1 in process_weights_after_loading.
     """
 
     model_dtype = None
@@ -454,7 +456,13 @@ class AscendW8A8MXFP8DSDynamicLinearMethod(AscendW8A8MXFP8DynamicLinearMethod):
         else:
             layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
             layer.weight_scale.data = layer.weight_scale.data.to(torch.uint8)
-        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(4, dim=1).repeat_interleave(128, dim=0)
+        # The kernel wants one ue8m0 scale per 32-K group: expand the
+        # block-square checkpoint scales to [N, K/32]. Works for both the V4
+        # 128x128 blocks (x4 along K) and the V4.1 32x32 blocks (x1).
+        block = self.block_size
+        layer.weight_scale.data = layer.weight_scale.data.repeat_interleave(block // 32, dim=1).repeat_interleave(
+            block, dim=0
+        )
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)

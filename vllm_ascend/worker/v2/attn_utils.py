@@ -894,7 +894,11 @@ def _reshape_kv_cache_v2(
                 v_cache = raw_cache[kv_start + k_size :].view(v_dtype).view(v_shape)
                 kv_caches[layer_name] = (k_cache, v_cache)
 
+    import sys as _s
+    print(f"[v41-dbg8] shared_kv_map={dict(shared_kv_cache_layers)} sample_keys={list(kv_caches.keys())[:6]}", file=_s.stderr, flush=True)
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
+        if target_layer_name not in kv_caches:
+            print(f"[v41-dbg8] MISSING target {target_layer_name} for {layer_name}", file=_s.stderr, flush=True)
         kv_caches[layer_name] = kv_caches[target_layer_name]
     return kv_caches
 

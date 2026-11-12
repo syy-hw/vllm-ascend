@@ -170,6 +170,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         assert self.update_stream is not None
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
+        # V4.1 layer-IO drain (post-replay instrumentation): dumps the
+        # persistent capture buffers this replay just rewrote
+        try:
+            from vllm_ascend.attention.dsa_v1 import v41_io_drain_all
+            v41_io_drain_all()
+        except Exception:  # noqa: BLE001 - instrumentation must not kill serving
+            pass
 
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
         # calculate num_tokens_across_dp.

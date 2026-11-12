@@ -75,7 +75,9 @@ class AscendCompressorStateCache(CompressorStateCache):
 
     def get_attn_backend(self):
         # Keep these imports lazy to avoid a model-inspection circular import.
-        if self.compress_ratio == 4:
+        if self.compress_ratio in (1, 2, 4):
+            # DeepSeek V4.1 compressed layers (ratio 1/2) share the C4 state
+            # cache execution path; ratio 1 owns no real state (see Compressor).
             from vllm_ascend.attention.dsa_v1 import AscendDSAC4StateBackend
 
             return AscendDSAC4StateBackend
@@ -103,6 +105,7 @@ class Compressor(nn.Module):
         head_dim: int = 512,
         rotate: bool = False,
         *,
+        no_ape: bool = False,
         cache_config: CacheConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -110,6 +113,10 @@ class Compressor(nn.Module):
         super().__init__()
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
 
+        if compress_ratio not in (1, 2, 4, 128):
+            raise ValueError(
+                f"Only support compress_ratio in [1, 2, 4, 128]. Got unsupported compress_ratio: {compress_ratio}"
+            )
         self.vllm_config = vllm_config
         self.config = config
         self.dim = config.hidden_size
@@ -122,7 +129,17 @@ class Compressor(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.coff = 1 + self.overlap
 
-        self.ape = nn.Parameter(torch.empty(compress_ratio, self.coff * self.head_dim, dtype=torch.float32))
+        if no_ape:
+            # DeepSeek V4.1 ships no ape weights; a zero ape makes the fused
+            # compressor op behave as plain softmax pooling. Non-persistent so
+            # the weight loader never looks for it.
+            self.register_buffer(
+                "ape",
+                torch.zeros(compress_ratio, self.coff * self.head_dim, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.ape = nn.Parameter(torch.empty(compress_ratio, self.coff * self.head_dim, dtype=torch.float32))
         self.wkv = ReplicatedLinear(
             self.dim,
             self.coff * self.head_dim,
@@ -133,16 +150,31 @@ class Compressor(nn.Module):
             prefix=f"{prefix}.wkv",
             return_bias=False,
         )
-        self.wgate = ReplicatedLinear(
-            self.dim,
-            self.coff * self.head_dim,
-            bias=False,
-            quant_config=None
-            if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
-            else quant_config,
-            prefix=f"{prefix}.wgate",
-            return_bias=False,
-        )
+        if compress_ratio == 1:
+            # V4.1 ratio-1 compression is a plain projection (official
+            # Compressor skips the gate when ratio == 1: a softmax over a
+            # single element is the identity). The fused op still wants a
+            # wgate tensor, so hand it a same-shape zero placeholder that is
+            # never loaded from the checkpoint.
+            self.wgate: ReplicatedLinear | None = None
+            # The fused op's prototype pins wgate to the activation dtype
+            # (bf16); softmax over one element is 1 regardless of the values.
+            self.register_buffer(
+                "wgate_zeros",
+                torch.zeros(self.coff * self.head_dim, self.dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        else:
+            self.wgate = ReplicatedLinear(
+                self.dim,
+                self.coff * self.head_dim,
+                bias=False,
+                quant_config=None
+                if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+                else quant_config,
+                prefix=f"{prefix}.wgate",
+                return_bias=False,
+            )
 
         # A5 compressor kernel needs float for norm_weight input
         norm_dtype = (
@@ -152,8 +184,8 @@ class Compressor(nn.Module):
 
         state_dtype = torch.float32
         # TODO(zyj): change following codes if block_size is configurable & refactor the magic numbers
-        if compress_ratio == 4:
-            self.state_cache = AscendCompressorStateCache(
+        if compress_ratio in (2, 4):
+            self.state_cache: AscendCompressorStateCache | None = AscendCompressorStateCache(
                 state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
@@ -169,8 +201,18 @@ class Compressor(nn.Module):
                 block_size=DSV4_BLOCK_SIZES[cache_config.block_size][0][3],
             )
         else:
-            raise ValueError(
-                f"Only support compress_ratio in [4, 128]. Got unsupported compress_ratio: {compress_ratio}"
+            # ratio 1: every token is its own complete group, so there is no
+            # partial-group state to carry across decode steps. The fused op
+            # takes an empty placeholder state tensor which it must not read
+            # (a ratio-1 group never spills into the state path).
+            self.state_cache = None
+            # The fused op validates state as 3-D [blocks, block, coff*D]
+            # regardless of ratio; a minimal guaranteed-unread block satisfies
+            # it (a ratio-1 group never spills into the state path).
+            self.register_buffer(
+                "state_placeholder",
+                torch.zeros(1, 1, self.coff * self.head_dim, dtype=torch.float32),
+                persistent=False,
             )
 
     def _compute_metadata(
@@ -219,20 +261,35 @@ class Compressor(nn.Module):
         metadata: AscendCompressorMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         compressor_metadata = metadata.cache.req_metadata
-        state_metadata = metadata.state.req_metadata
         assert compressor_metadata is not None
-        assert state_metadata is not None
         compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
+        if self.wgate is not None:
+            wgate_weight = self.wgate.weight
+        else:
+            # ratio 1: zero placeholder, softmax(gate)=1 over a single element
+            wgate_weight = self.wgate_zeros
+        state_block_table = None
+        if state_cache is not None and isinstance(state_cache, torch.Tensor) and state_cache.numel() > 0:
+            state_input = state_cache.squeeze(-2)
+            state_req_metadata = getattr(metadata.state, "req_metadata", None) if metadata.state is not None else None
+            if state_req_metadata is not None:
+                state_block_table = state_req_metadata.block_table
+        else:
+            # ratio 1: no partial-group state exists; the op must not read it.
+            # TODO(container smoke): if the fused compressor op rejects a null
+            # state at cmp_ratio=1, switch to a minimal 1-block placeholder
+            # table (guaranteed unread) per spec B1.
+            state_input = self.state_placeholder
         compressed_kv = torch.ops._C_ascend.compressor(
             hidden_states,
             self.wkv.weight,
-            self.wgate.weight,
-            state_cache.squeeze(-2),
+            wgate_weight,
+            state_input,
             self.ape,
             self.norm.weight,
             compress_sin.view(-1, compress_sin.shape[-1]),
             compress_cos.view(-1, compress_cos.shape[-1]),
-            state_block_table=state_metadata.block_table,
+            state_block_table=state_block_table,
             cu_seqlens=compressor_metadata.query_start_loc,
             seqused=None,
             start_pos=compressor_metadata.start_pos,

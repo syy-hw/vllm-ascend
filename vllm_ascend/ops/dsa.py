@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -76,6 +77,12 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         need_gather_q_kv: bool = False,
+        has_compressed: bool | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
+        shared_index_runtime: Any | None = None,
+        # V4.1: official Attention applies NO per-head RMSNorm on q after
+        # wq_b; False skips the V4-baseline q head RMS. Default True (V4).
+        apply_q_head_rms: bool = True,
     ) -> None:
         nn.Module.__init__(self)
         self.dim = dim
@@ -92,6 +99,8 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         self.n_local_groups = n_local_groups
         self.window_size = window_size
         self.compress_ratio = compress_ratio
+        # DeepSeek V4.1: ratio 1 must be told apart from pure SWA (spec B3).
+        self.has_compressed = (compress_ratio > 1) if has_compressed is None else bool(has_compressed)
         self.need_gather_q_kv = need_gather_q_kv
 
         self.wq_a = dsa_modules.wq_a
@@ -141,12 +150,23 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
             attn_sink=self.attn_sink,
             eps=self.eps,
             swa_cache_layer=self.swa_cache_layer,
+            has_compressed=self.has_compressed,
+            kv_sharing_target_layer_name=getattr(self, "kv_sharing_target_layer_name", None),
+            topk_indices_buffer=topk_indices_buffer,
+            # V4.1: model-level hand-off (index-K provider + candidates) that
+            # owns_k layers publish and non-owns_k index sources consume.
+            shared_index_runtime=shared_index_runtime,
+            apply_q_head_rms=apply_q_head_rms,
         )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        # Patch 71: keep a direct handle so _build_kv_cache can resolve the
+        # V4.1 kv-source layer's cache without get_current_vllm_config(),
+        # which is unset in the dummy-batch/warmup forward contexts.
+        self._vllm_static_forward_context = compilation_config.static_forward_context
 
     def forward(
         self,
@@ -208,6 +228,32 @@ def dsa_forward(
         )
     else:
         self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states, kv_cache, attn_metadata, output)
+    # R56: one-shot dump of L0's attention output BEFORE the output
+    # projection, on the same first-real-forward the model-level layer
+    # dumps select. Bisects Q/KV->window-attention vs o_proj for the
+    # eager-prefill L0 divergence.
+    try:
+        from vllm_ascend.models.deepseek_v41.model import _V41_DUMP as _D
+        if (_D.get("active") and not _D.get("attn0_done")
+                and self.dsa_attn.layer_name.endswith(".layers.0.self_attn.attn")):
+            _D["attn0_done"] = True
+            import os as _os
+
+            import torch as _t
+            _rank = _os.environ.get("VLLM_DP_RANK", "0")
+            _base = _os.path.join(_D["dir"], f"L0_pid{_os.getpid()}_r{_rank}")
+            _t.save({"tensor": output.detach().cpu(),
+                     "shape": tuple(output.shape),
+                     "dtype": str(output.dtype)},
+                    _base + "_attnpost_o_proj.pt")
+            _opi = getattr(self.dsa_attn.impl, "o_proj_input", None)
+            if _opi is not None:
+                _t.save({"tensor": _opi.detach().cpu(),
+                         "shape": tuple(_opi.shape),
+                         "dtype": str(_opi.dtype)},
+                        _base + "_attnpre_o_proj.pt")
+    except Exception:  # noqa: BLE001 - probe must never kill serving
+        pass
     return
 
 
@@ -239,14 +285,62 @@ def _build_kv_cache(self, forward_context):
     indexer_scale_cache = None
     indexer_full_cache = None
 
-    if self.compress_ratio > 1:
-        state_cache = self.compressor.state_cache.kv_cache
+    if self.has_compressed:
+        if self.compressor is not None and self.compressor.state_cache is not None:
+            state_cache = self.compressor.state_cache.kv_cache
+        # A V4.1 shared compressed layer has compressor=None and reads the
+        # compressed KV through the shared dsa_attn.kv_cache binding below.
         compress_kv_cache = self.dsa_attn.kv_cache
         virtual_engine = getattr(forward_context, "virtual_engine", None)
         if virtual_engine is not None and isinstance(compress_kv_cache, (list, tuple)):
             compress_kv_cache = compress_kv_cache[virtual_engine]
-    if self.compress_ratio == 4:
-        indexer_state_cache = self.indexer.compressor.state_cache.kv_cache
+        # Patch 71: a V4.1 shared compressed layer (v41_kv_source_layer_name
+        # set, assigned only to non-kv-source layers) must ALWAYS read its kv
+        # source's compressed cache. With the generic kv-sharing grouping off
+        # (VLLM_V41_DISABLE_KV_SHARING=1) the runner still allocates the
+        # shared layer a private compressed cache; that allocation is
+        # non-empty, so the previous "resolve the source only when the own
+        # binding is empty" fallback never fired, and every shared layer
+        # attended an ALL-ZERO compressed stream (op-level capture, decode
+        # step 963: L2 cmp page 105/128 live rows vs L3 same pages 0 live
+        # rows, identical top-k). Short generations stayed correct because
+        # the window + sink + the eight owning layers carry them; long
+        # generations progressively lost compressed context and degenerated
+        # into the fixed-vocabulary soup. The V4 baseline never sets
+        # v41_kv_source_layer_name, so its path is unchanged.
+        v41_shared_target = getattr(self.dsa_attn, "v41_kv_source_layer_name", None)
+        if v41_shared_target is not None:
+            static_ctx = getattr(self, "_vllm_static_forward_context", None)
+            target_attn = static_ctx.get(v41_shared_target) if static_ctx is not None else None
+            target_cache = getattr(target_attn, "kv_cache", None) if target_attn is not None else None
+            if isinstance(target_cache, (list, tuple)) and len(target_cache) > 0:
+                ve = virtual_engine if virtual_engine is not None else 0
+                target_cache = target_cache[ve] if ve < len(target_cache) else target_cache[0]
+            if target_cache is not None and torch.is_tensor(target_cache) and target_cache.numel() > 0:
+                compress_kv_cache = target_cache
+        elif compress_kv_cache is None or (
+            torch.is_tensor(compress_kv_cache) and compress_kv_cache.numel() == 0
+        ):
+            # V4.1 fallback: the runner did not alias this shared layer onto
+            # its kv source's cache (empty binding). Read the source layer's
+            # cache directly so the compressed stream is never empty (an
+            # absent cmp_kv with cmp_ratio>1 is rejected by SparseFlashMla)
+            # nor a never-written private cache.
+            target_name = getattr(self.dsa_attn, "v41_kv_source_layer_name", None) or getattr(
+                self.dsa_attn, "kv_sharing_target_layer_name", None
+            )
+            if target_name:
+                static_ctx = get_current_vllm_config().compilation_config.static_forward_context
+                target_attn = static_ctx.get(target_name)
+                target_cache = getattr(target_attn, "kv_cache", None) if target_attn is not None else None
+                if virtual_engine is not None and isinstance(target_cache, (list, tuple)):
+                    target_cache = target_cache[virtual_engine]
+                if target_cache is not None and torch.is_tensor(target_cache) and target_cache.numel() > 0:
+                    compress_kv_cache = target_cache
+    if self.indexer is not None and getattr(self.indexer, "owns_k", True):
+        indexer_compressor = getattr(self.indexer, "compressor", None)
+        if indexer_compressor is not None and indexer_compressor.state_cache is not None:
+            indexer_state_cache = indexer_compressor.state_cache.kv_cache
         if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
             indexer_k_cache, indexer_scale_cache, indexer_full_cache = unfold_kvcache(self.indexer.k_cache.kv_cache)
         else:

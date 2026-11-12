@@ -9,6 +9,19 @@ from typing import Any
 import torch
 import torch_npu
 
+import torch_npu
+
+# Graph-safe scatter: npu_scatter_nd_update_ is an in-place op whose
+# mutation is ELIMINATED by the engine's FX compilation (the compiled
+# graph contains ZERO scatter nodes — verified via debug_dump_path).
+# Registering it as a custom op with mutates_args tells the compiler the
+# cache IS modified, preventing dead-code elimination.
+@torch.library.custom_op("vllm_ascend::vsa_scatter_kv", mutates_args={"cache"})
+def _vsa_scatter_kv(cache: torch.Tensor, indices: torch.Tensor,
+                    updates: torch.Tensor) -> None:
+    torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+
+
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -114,12 +127,11 @@ class DsaAttnKvPlan:
         if self.uses_sparse_flash_mla:
             if slot_mapping.ndim != 2 or slot_mapping.shape[-1] != 2:
                 raise ValueError(f"BF16 DSA slot_mapping must be [num_tokens, 2], got {tuple(slot_mapping.shape)}.")
-            # Keep fixed [T, 2] shape under ACLGraph. SparseFlashMla's
-            # scatter path receives padded [-1, -1] rows directly; do not
-            # introduce a data-dependent Nonzero/gather operation here.
             indices = slot_mapping.to(torch.int64).contiguous()
             updates = x.reshape((slot_mapping.shape[0],) + tuple(cache.shape[2:])).contiguous()
-            torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+            # Use the custom op so the engine's FX compiler preserves the
+            # in-place mutation (raw npu_scatter_nd_update_ is eliminated)
+            torch.ops.vllm_ascend.vsa_scatter_kv(cache, indices, updates)
             return
         if not self.uses_kv_compress_epilog:
             torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)

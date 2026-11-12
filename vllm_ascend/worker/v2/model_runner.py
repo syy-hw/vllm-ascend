@@ -283,9 +283,16 @@ class NPUModelRunner(GPUModelRunner):
         override_mrv2_in_profile_run to True to force moe load to be balanced when executing `profile_run`
         """
         mc2_tokens_capacity = get_mc2_tokens_capacity()
+        # V41_SKIP_MC2_PROFILE=1 (debug env): skip the capacity-sized MC2 dummy
+        # run. On this stack the MoeDistributeDispatch tiling rejects the
+        # 512-token-per-rank window this dummy reserves (Get WinSize failed),
+        # while real small-batch forwards run the MC2 path fine. Skipping the
+        # reservation only risks MC2 fallback for very large batches.
+        _skip_mc2_profile = __import__("os").environ.get("V41_SKIP_MC2_PROFILE", "0") == "1"
         with override_mrv2_in_profile_run(True):
             if (
-                mc2_tokens_capacity is not None
+                not _skip_mc2_profile
+                and mc2_tokens_capacity is not None
                 and self.max_num_tokens > mc2_tokens_capacity
                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
@@ -509,6 +516,54 @@ class NPUModelRunner(GPUModelRunner):
                 seq_lens_np=self.input_buffers.seq_lens_np,
                 attn_state=attn_state,
             )
+
+            # V4.1 graph-decode eager prepare (runs for EVERY step, including
+            # the steps that will replay the ACL graph — only this Python
+            # runs then): (a) publish the engine request-slot ids into the
+            # DSA persist channel (stable request identity for the
+            # device-side pool state; refreshed before each build/replay),
+            # (b) on FULL-graph steps stage the engram computation's host
+            # half (hash + CPU-mmap gather) into the persistent buffers.
+            from vllm_ascend.attention.dsa_v1 import v41_write_req_slots
+
+            v41_write_req_slots(idx_mapping)
+            if __import__("os").environ.get("V41_MSPROBE_DIR", ""):
+                # advance the msProbe step counter once per ENGINE step so
+                # dumps align to steps (the counter does not self-advance
+                # for inference serving)
+                try:
+                    from msprobe.pytorch import PrecisionDebugger
+                    PrecisionDebugger.step()
+                except Exception:  # noqa: BLE001 - instrumentation only
+                    pass
+            # Stage the engram buffers for EVERY step of the compiled runner
+            # (prefill batches carry cg_mode=NONE under FULL_DECODE_ONLY —
+            # they still execute through the compiled backbone, where the
+            # engram hash path returns None because it is host code and the
+            # layer branch reads these staged buffers instead). Without
+            # staging, prefill engram layers (1/14) applied the engram over
+            # the zero-initialized buffer, dropping the official n-gram
+            # contribution for all prefill tokens (observed: graph prefill
+            # L1 attention input diverged from eager by 0.046 while L0 was
+            # bit-exact; decode stayed bit-exact because decode batches
+            # reached the old cg_mode==FULL staging path).
+            # the runner's model is the ForCausalLM wrapper; the hook
+            # lives on the inner transformer (or nowhere on other models)
+            _v41_m = getattr(self, "model", None)
+            _v41_engram_hook = getattr(_v41_m, "v41_engram_graph_hook", None)
+            if _v41_engram_hook is None:
+                _v41_engram_hook = getattr(
+                    getattr(_v41_m, "model", None), "v41_engram_graph_hook", None
+                )
+            if _v41_engram_hook is not None:
+                _v41_engram_hook(
+                    input_batch,
+                    # buffer/batch bound is the token budget, NOT
+                    # max_num_reqs (prefill batches carry up to
+                    # max_num_batched_tokens rows)
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    idx_mapping_cpu.tolist(),
+                )
 
             input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 

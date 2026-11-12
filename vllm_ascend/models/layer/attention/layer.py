@@ -93,6 +93,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        has_compressed: bool | None = None,
         **extra_impl_args,
     ):
         super().__init__()
@@ -109,6 +110,10 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         self.n_local_groups = n_local_groups
         self.window_size = window_size
         self.compress_ratio = compress_ratio
+        # DeepSeek V4.1: compress_ratio 1 is ambiguous (compressed vs pure
+        # SWA). The model passes has_compressed explicitly; None keeps the
+        # V4 rule (ratio > 1) for existing callers.
+        self.has_compressed = (compress_ratio > 1) if has_compressed is None else bool(has_compressed)
         self.layer_name = prefix
         self.head_size = self.head_dim
         self.swa_cache_layer: DeepseekV4SWACache = extra_impl_args.get("swa_cache_layer")
@@ -123,10 +128,12 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
-        if self.compress_ratio == 4:
-            self.attn_backend = AscendDSAC4Backend
-        elif self.compress_ratio == 128:
+        if self.compress_ratio == 128:
             self.attn_backend = AscendDSAC128Backend
+        elif self.has_compressed:
+            # Compressed layers (V4 ratio 4; V4.1 ratio 1/2) all run the C4
+            # execution plan; only 128-to-1 has a dedicated backend.
+            self.attn_backend = AscendDSAC4Backend
         else:
             self.attn_backend = AscendDSASWABackend
 
@@ -154,6 +161,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             window_size=self.window_size,
             compress_ratio=self.compress_ratio,
             vllm_config=get_current_vllm_config(),
+            has_compressed=self.has_compressed,
             **extra_impl_args,
         )
 
@@ -188,7 +196,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
+        if not self.has_compressed:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
         use_bf16_kv = is_a5_bf16_kv_enabled(vllm_config)

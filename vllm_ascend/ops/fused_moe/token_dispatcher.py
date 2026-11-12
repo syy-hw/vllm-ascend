@@ -231,6 +231,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        if __import__("os").environ.get("V41_DUMP_DISPATCH", "0") == "1":
+            import sys as _s
+            _sig = {k: (tuple(v.shape) if hasattr(v, "shape") else v) for k, v in kwargs_mc2.items()}
+            print(f"[v41-dispatch] rank_kwargs={_sig}", file=_s.stderr, flush=True)
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
@@ -611,6 +615,15 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
+        # R39 tear guard: under long-context concurrent load a device-side
+        # writer stamps small metadata tensors across the model (indexer
+        # cl/pool/seq_lens and MoE routing ids). A torn topk_id outside
+        # [0, num_experts) is DROPPED by histc, every downstream count
+        # shifts, and repeat_interleave/permute trap the device (507015,
+        # the R39 crash). Clamp first: the histogram total stays equal to
+        # numel so all counts remain consistent; only the torn tokens get
+        # mis-routed.
+        topk_ids = topk_ids.clamp(0, self.num_experts - 1)
         num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts)
 
         ep_size = self.ep_size

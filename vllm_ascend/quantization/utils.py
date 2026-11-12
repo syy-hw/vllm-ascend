@@ -46,11 +46,23 @@ def is_fused_moe_layer(layer: torch.nn.Module) -> bool:
 def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     """Select the MX scale algorithm used by DynamicMxQuantV3.
 
+    R60: V41_MX_ALG=1 forces scale_alg=1 — the semantics the frozen
+    official act_quant uses (map block amax to the fp8 range, then round
+    the E8M0 exponent). On this platform the capability gate picks 0 for
+    the runtime ACTIVATION quant while the weight requant uses 1; the
+    mixed (w=1, a=0) combination reproduces the serving wq_a output
+    bit-exactly (r59_wqa_probe sweep) and its 0.0059 deviation from the
+    official math comes entirely from the activation-side alg.
+
     ``scale_alg=0`` derives a shared exponent directly from the block's
     maximum absolute value. ``scale_alg=1`` first maps that maximum to the
     destination FP8 range, then rounds the E8M0 scale exponent up to avoid
     quantization overflow. MiniMax M3 checkpoints require the latter.
     """
+    import os as _os
+
+    if _os.environ.get("V41_MX_ALG", "0") == "1":
+        return 1
     if not get_current_hardware_profile().supports(HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE):
         return 0
 

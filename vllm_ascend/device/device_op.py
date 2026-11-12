@@ -645,6 +645,11 @@ class BaseDeviceAdaptor:
         if compress_ratio == 4:
             # [0]=compress, [1]=swa, [2]=state, [3]=unused, [4]=ik, [5]=isc
             return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache)
+        elif compress_ratio in (1, 2):
+            # DeepSeek V4.1 compressed layers share the c4 tuple layout; a
+            # pure SWA layer produces the same tuple (its compress/state/
+            # indexer slots are None), so routing ratio 1 here is safe.
+            return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache)
         elif compress_ratio == 128:
             return (kv_cache[0], kv_cache[1], kv_cache[2], None, None, full_cache)
         else:
@@ -1414,6 +1419,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         idx_full = 6
         full_cache = kv_cache[idx_full]
         if compress_ratio == 4:
+            return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache)
+        elif compress_ratio in (1, 2):
+            # DeepSeek V4.1 compressed layers share the c4 tuple layout; pure
+            # SWA layers produce the same tuple (compress/state slots None).
             return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache)
         elif compress_ratio == 128:
             return (kv_cache[0], kv_cache[1], kv_cache[2], None, None, full_cache)
